@@ -45,6 +45,8 @@ pub const Builder = struct {
     verbose_llvm_ir: bool,
     verbose_cimport: bool,
     verbose_llvm_cpu_features: bool,
+    enable_time_report: bool,
+    llvm_use_newpm: bool,
     color: enum { auto, on, off } = .auto,
     invalid_user_input: bool,
     zig_exe: []const u8,
@@ -147,6 +149,8 @@ pub const Builder = struct {
             .verbose_llvm_ir = false,
             .verbose_cimport = false,
             .verbose_llvm_cpu_features = false,
+            .enable_time_report = false,
+            .llvm_use_newpm = false,
             .invalid_user_input = false,
             .allocator = allocator,
             .user_input_options = UserInputOptionsMap.init(allocator),
@@ -2308,6 +2312,8 @@ pub const LibExeObjStep = struct {
         if (builder.verbose_link or self.verbose_link) zig_args.append("--verbose-link") catch unreachable;
         if (builder.verbose_cc or self.verbose_cc) zig_args.append("--verbose-cc") catch unreachable;
         if (builder.verbose_llvm_cpu_features) zig_args.append("--verbose-llvm-cpu-features") catch unreachable;
+        if (builder.enable_time_report) zig_args.append("-ftime-report") catch unreachable;
+        if (builder.llvm_use_newpm) zig_args.append("-fllvm-new-pm") catch unreachable;
 
         if (self.emit_llvm_ir) try zig_args.append("-femit-llvm-ir");
         if (self.emit_asm) try zig_args.append("-femit-asm");
