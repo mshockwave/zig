@@ -130,6 +130,7 @@ pub const Module = extern struct {
     verbose_llvm_ir: bool,
     verbose_cimport: bool,
     verbose_llvm_cpu_features: bool,
+    llvm_use_newpm: bool,
 
     // Set by stage1
     have_c_main: bool,

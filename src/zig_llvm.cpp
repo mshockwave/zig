@@ -186,7 +186,8 @@ unsigned ZigLLVMDataLayoutGetProgramAddressSpace(LLVMTargetDataRef TD) {
 bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machine_ref, LLVMModuleRef module_ref,
         char **error_message, bool is_debug,
         bool is_small, bool time_report, bool tsan, bool lto,
-        const char *asm_filename, const char *bin_filename, const char *llvm_ir_filename)
+        const char *asm_filename, const char *bin_filename, const char *llvm_ir_filename,
+        bool use_newpm)
 {
     TimePassesIsEnabled = time_report;
 

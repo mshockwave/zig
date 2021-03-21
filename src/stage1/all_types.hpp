@@ -2173,6 +2173,7 @@ struct CodeGen {
     bool verbose_llvm_ir;
     bool verbose_cimport;
     bool verbose_llvm_cpu_features;
+    bool llvm_use_newpm;
     bool error_during_imports;
     bool generate_error_name_table;
     bool enable_time_report;

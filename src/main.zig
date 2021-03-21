@@ -301,6 +301,7 @@ const usage_build_generic =
     \\  -fno-dll-export-fns       Force-disable marking exported functions as DLL exports
     \\  -fLLVM                    Force using LLVM as the codegen backend
     \\  -fno-LLVM                 Prevent using LLVM as a codegen backend
+    \\  -fllvm-new-pm             Use new LLVM PassManager (experimental)
     \\  -fClang                   Force using Clang as the C/C++ compilation backend
     \\  -fno-Clang                Prevent using Clang as the C/C++ compilation backend
     \\  --strip                   Omit debug symbols
@@ -499,6 +500,7 @@ fn buildOutputType(
     var verbose_llvm_ir = false;
     var verbose_cimport = false;
     var verbose_llvm_cpu_features = false;
+    var llvm_use_newpm = false;
     var time_report = false;
     var stack_report = false;
     var show_builtin = false;
@@ -902,6 +904,8 @@ fn buildOutputType(
                         use_llvm = true;
                     } else if (mem.eql(u8, arg, "-fno-LLVM")) {
                         use_llvm = false;
+                    } else if (mem.eql(u8, arg, "-fllvm-new-pm")) {
+                        llvm_use_newpm = true;
                     } else if (mem.eql(u8, arg, "-fLLD")) {
                         use_lld = true;
                     } else if (mem.eql(u8, arg, "-fno-LLD")) {
@@ -1901,6 +1905,7 @@ fn buildOutputType(
         .verbose_llvm_ir = verbose_llvm_ir,
         .verbose_cimport = verbose_cimport,
         .verbose_llvm_cpu_features = verbose_llvm_cpu_features,
+        .llvm_use_newpm = llvm_use_newpm,
         .machine_code_model = machine_code_model,
         .color = color,
         .time_report = time_report,

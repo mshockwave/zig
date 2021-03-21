@@ -112,6 +112,7 @@ void zig_stage1_build_object(struct ZigStage1 *stage1) {
     g->verbose_llvm_ir = stage1->verbose_llvm_ir;
     g->verbose_cimport = stage1->verbose_cimport;
     g->verbose_llvm_cpu_features = stage1->verbose_llvm_cpu_features;
+    g->llvm_use_newpm = stage1->llvm_use_newpm;
 
     g->err_color = stage1->err_color;
     g->code_model = stage1->code_model;
