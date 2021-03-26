@@ -57,6 +57,15 @@
 
 #include <lld/Common/Driver.h>
 
+// FIXME: Guard with macro
+// Headers for the new pass manager
+#include "llvm/IR/PassManager.h"
+#include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/StandardInstrumentations.h"
+#include "llvm/Transforms/Utils/AddDiscriminators.h"
+#include "llvm/Transforms/Utils/CanonicalizeAliases.h"
+#include "llvm/Transforms/Utils/NameAnonGlobals.h"
+
 #if __GNUC__ >= 9
 #pragma GCC diagnostic pop
 #endif
@@ -183,6 +192,109 @@ unsigned ZigLLVMDataLayoutGetProgramAddressSpace(LLVMTargetDataRef TD) {
     return unwrap(TD)->getProgramAddressSpace();
 }
 
+static bool emitUsingNewPM(Module &module, TargetMachine &target_machine,
+                           bool is_debug, bool is_small,
+                           bool time_report, bool tsan, bool lto,
+                           raw_fd_ostream *dest_asm, raw_fd_ostream *dest_bin,
+                           char **error_message) {
+  PipelineTuningOptions pipeline_opts;
+  pipeline_opts.LoopUnrolling = !is_debug;
+  pipeline_opts.SLPVectorization = !is_debug;
+  pipeline_opts.LoopVectorization = !is_debug;
+  pipeline_opts.LoopInterleaving = !is_debug;
+
+  PassInstrumentationCallbacks instr_callbacks;
+  StandardInstrumentations std_instrumentations;
+  std_instrumentations.registerCallbacks(instr_callbacks);
+
+  PassBuilder pass_builder(&target_machine, pipeline_opts,
+                           None, &instr_callbacks);
+  using OptimizationLevel = typename PassBuilder::OptimizationLevel;
+
+  LoopAnalysisManager loop_am;
+  FunctionAnalysisManager function_am;
+  CGSCCAnalysisManager cgscc_am;
+  ModuleAnalysisManager module_am;
+
+  // Register the AA manager first so that our version is the one used
+  function_am.registerPass([&] {
+    return pass_builder.buildDefaultAAPipeline();
+  });
+
+  Triple target_triple(module.getTargetTriple());
+  auto tlii = std::make_unique<TargetLibraryInfoImpl>(target_triple);
+  function_am.registerPass([&] { return TargetLibraryAnalysis(*tlii); });
+
+  pass_builder.registerModuleAnalyses(module_am);
+  pass_builder.registerCGSCCAnalyses(cgscc_am);
+  pass_builder.registerFunctionAnalyses(function_am);
+  pass_builder.registerLoopAnalyses(loop_am);
+  pass_builder.crossRegisterProxies(loop_am, function_am,
+                                    cgscc_am, module_am);
+
+  if (!is_debug) {
+    pass_builder.registerPipelineStartEPCallback(
+      [](ModulePassManager &module_pm) {
+        module_pm.addPass(
+          createModuleToFunctionPassAdaptor(AddDiscriminatorsPass()));
+      });
+  }
+
+  if (tsan) {
+    pass_builder.registerOptimizerLastEPCallback(
+      [](ModulePassManager &module_pm, OptimizationLevel level) {
+        // Will be enabled regardless of optimization level
+        module_pm.addPass(ThreadSanitizerPass());
+      });
+  }
+
+  ModulePassManager module_pm;
+  // FIXME: NewPM can not detach speed level from size level
+  // we can't create something like "maximum speed level and optimal size level"
+  // which is what the original code wanted to achieve
+  OptimizationLevel opt_level;
+  if (is_debug)
+    opt_level = OptimizationLevel::O0;
+  else if (is_small)
+    opt_level = OptimizationLevel::Oz;
+  else
+    opt_level = OptimizationLevel::O3;
+
+  if (lto) {
+    module_pm = pass_builder.buildLTOPreLinkDefaultPipeline(opt_level);
+    module_pm.addPass(CanonicalizeAliasesPass());
+    module_pm.addPass(NameAnonGlobalPass());
+  } else {
+    module_pm = pass_builder.buildPerModuleDefaultPipeline(opt_level);
+  }
+
+  // Unfortunately we don't have new PM for code generation
+  legacy::PassManager codegen_pm;
+  codegen_pm.add(
+    createTargetTransformInfoWrapperPass(target_machine.getTargetIRAnalysis()));
+
+  if (dest_bin && !lto) {
+      if (target_machine.addPassesToEmitFile(codegen_pm, *dest_bin, nullptr, CGFT_ObjectFile)) {
+          *error_message = strdup("TargetMachine can't emit an object file");
+          return true;
+      }
+  }
+  if (dest_asm) {
+      if (target_machine.addPassesToEmitFile(codegen_pm, *dest_asm, nullptr, CGFT_AssemblyFile)) {
+          *error_message = strdup("TargetMachine can't emit an assembly file");
+          return true;
+      }
+  }
+
+  // optimization
+  module_pm.run(module, module_am);
+
+  // code generation
+  codegen_pm.run(module);
+
+  return false;
+}
+
 bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machine_ref, LLVMModuleRef module_ref,
         char **error_message, bool is_debug,
         bool is_small, bool time_report, bool tsan, bool lto,
@@ -216,100 +328,105 @@ bool ZigLLVMTargetMachineEmitToFile(LLVMTargetMachineRef targ_machine_ref, LLVMM
 
     Module* module = unwrap(module_ref);
 
-    PassManagerBuilder *PMBuilder = new(std::nothrow) PassManagerBuilder();
-    if (PMBuilder == nullptr) {
-        *error_message = strdup("memory allocation failure");
+    if (use_newpm) {
+      if (emitUsingNewPM(*module, *target_machine,
+                         is_debug, is_small,
+                         time_report, tsan, lto,
+                         dest_asm, dest_bin,
+                         error_message))
         return true;
-    }
-    PMBuilder->OptLevel = target_machine->getOptLevel();
-    PMBuilder->SizeLevel = is_small ? 2 : 0;
-
-    PMBuilder->DisableTailCalls = is_debug;
-    PMBuilder->DisableUnrollLoops = is_debug;
-    PMBuilder->SLPVectorize = !is_debug;
-    PMBuilder->LoopVectorize = !is_debug;
-    PMBuilder->LoopsInterleaved = !PMBuilder->DisableUnrollLoops;
-    PMBuilder->RerollLoops = !is_debug;
-    // Leaving NewGVN as default (off) because when on it caused issue #673
-    //PMBuilder->NewGVN = !is_debug;
-    PMBuilder->DisableGVNLoadPRE = is_debug;
-    PMBuilder->VerifyInput = assertions_on;
-    PMBuilder->VerifyOutput = assertions_on;
-    PMBuilder->MergeFunctions = !is_debug;
-    PMBuilder->PrepareForLTO = lto;
-    PMBuilder->PrepareForThinLTO = false;
-    PMBuilder->PerformThinLTO = false;
-
-    TargetLibraryInfoImpl tlii(Triple(module->getTargetTriple()));
-    PMBuilder->LibraryInfo = &tlii;
-
-    if (is_debug) {
-        PMBuilder->Inliner = createAlwaysInlinerLegacyPass(false);
     } else {
-        target_machine->adjustPassManager(*PMBuilder);
+      PassManagerBuilder *PMBuilder = new(std::nothrow) PassManagerBuilder();
+      if (PMBuilder == nullptr) {
+          *error_message = strdup("memory allocation failure");
+          return true;
+      }
+      PMBuilder->OptLevel = target_machine->getOptLevel();
+      PMBuilder->SizeLevel = is_small ? 2 : 0;
 
-        PMBuilder->addExtension(PassManagerBuilder::EP_EarlyAsPossible, addDiscriminatorsPass);
-        PMBuilder->Inliner = createFunctionInliningPass(PMBuilder->OptLevel, PMBuilder->SizeLevel, false);
+      PMBuilder->DisableTailCalls = is_debug;
+      PMBuilder->DisableUnrollLoops = is_debug;
+      PMBuilder->SLPVectorize = !is_debug;
+      PMBuilder->LoopVectorize = !is_debug;
+      PMBuilder->LoopsInterleaved = !PMBuilder->DisableUnrollLoops;
+      PMBuilder->RerollLoops = !is_debug;
+      // Leaving NewGVN as default (off) because when on it caused issue #673
+      //PMBuilder->NewGVN = !is_debug;
+      PMBuilder->DisableGVNLoadPRE = is_debug;
+      PMBuilder->VerifyInput = assertions_on;
+      PMBuilder->VerifyOutput = assertions_on;
+      PMBuilder->MergeFunctions = !is_debug;
+      PMBuilder->PrepareForLTO = lto;
+      PMBuilder->PrepareForThinLTO = false;
+      PMBuilder->PerformThinLTO = false;
+
+      TargetLibraryInfoImpl tlii(Triple(module->getTargetTriple()));
+      PMBuilder->LibraryInfo = &tlii;
+
+      if (is_debug) {
+          PMBuilder->Inliner = createAlwaysInlinerLegacyPass(false);
+      } else {
+          target_machine->adjustPassManager(*PMBuilder);
+
+          PMBuilder->addExtension(PassManagerBuilder::EP_EarlyAsPossible, addDiscriminatorsPass);
+          PMBuilder->Inliner = createFunctionInliningPass(PMBuilder->OptLevel, PMBuilder->SizeLevel, false);
+      }
+
+      if (tsan) {
+          PMBuilder->addExtension(PassManagerBuilder::EP_OptimizerLast, addThreadSanitizerPass);
+          PMBuilder->addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0, addThreadSanitizerPass);
+      }
+
+      // Set up the per-function pass manager.
+      legacy::FunctionPassManager FPM = legacy::FunctionPassManager(module);
+      auto tliwp = new(std::nothrow) TargetLibraryInfoWrapperPass(tlii);
+      FPM.add(tliwp);
+      FPM.add(createTargetTransformInfoWrapperPass(target_machine->getTargetIRAnalysis()));
+      if (assertions_on) {
+          FPM.add(createVerifierPass());
+      }
+      PMBuilder->populateFunctionPassManager(FPM);
+
+      // Set up the per-module pass manager.
+      legacy::PassManager MPM;
+      MPM.add(createTargetTransformInfoWrapperPass(target_machine->getTargetIRAnalysis()));
+      PMBuilder->populateModulePassManager(MPM);
+
+      // Set output passes.
+      if (dest_bin && !lto) {
+          if (target_machine->addPassesToEmitFile(MPM, *dest_bin, nullptr, CGFT_ObjectFile)) {
+              *error_message = strdup("TargetMachine can't emit an object file");
+              return true;
+          }
+      }
+      if (dest_asm) {
+          if (target_machine->addPassesToEmitFile(MPM, *dest_asm, nullptr, CGFT_AssemblyFile)) {
+              *error_message = strdup("TargetMachine can't emit an assembly file");
+              return true;
+          }
+      }
+
+      // run per function optimization passes
+      FPM.doInitialization();
+      for (Function &F : *module)
+      if (!F.isDeclaration())
+          FPM.run(F);
+      FPM.doFinalization();
+
+      MPM.run(*module);
     }
 
-    if (tsan) {
-        PMBuilder->addExtension(PassManagerBuilder::EP_OptimizerLast, addThreadSanitizerPass);
-        PMBuilder->addExtension(PassManagerBuilder::EP_EnabledOnOptLevel0, addThreadSanitizerPass);
+    if (llvm_ir_filename) {
+        if (LLVMPrintModuleToFile(module_ref, llvm_ir_filename, error_message)) {
+            return true;
+        }
+    }
+    if (dest_bin && lto) {
+        WriteBitcodeToFile(*module, *dest_bin);
     }
 
-    // Set up the per-function pass manager.
-    legacy::FunctionPassManager FPM = legacy::FunctionPassManager(module);
-    auto tliwp = new(std::nothrow) TargetLibraryInfoWrapperPass(tlii);
-    FPM.add(tliwp);
-    FPM.add(createTargetTransformInfoWrapperPass(target_machine->getTargetIRAnalysis()));
-    if (assertions_on) {
-        FPM.add(createVerifierPass());
-    }
-    PMBuilder->populateFunctionPassManager(FPM);
-
-    {
-        // Set up the per-module pass manager.
-        legacy::PassManager MPM;
-        MPM.add(createTargetTransformInfoWrapperPass(target_machine->getTargetIRAnalysis()));
-        PMBuilder->populateModulePassManager(MPM);
-
-        // Set output passes.
-        if (dest_bin && !lto) {
-            if (target_machine->addPassesToEmitFile(MPM, *dest_bin, nullptr, CGFT_ObjectFile)) {
-                *error_message = strdup("TargetMachine can't emit an object file");
-                return true;
-            }
-        }
-        if (dest_asm) {
-            if (target_machine->addPassesToEmitFile(MPM, *dest_asm, nullptr, CGFT_AssemblyFile)) {
-                *error_message = strdup("TargetMachine can't emit an assembly file");
-                return true;
-            }
-        }
-
-        // run per function optimization passes
-        FPM.doInitialization();
-        for (Function &F : *module)
-        if (!F.isDeclaration())
-            FPM.run(F);
-        FPM.doFinalization();
-
-        MPM.run(*module);
-
-        if (llvm_ir_filename) {
-            if (LLVMPrintModuleToFile(module_ref, llvm_ir_filename, error_message)) {
-                return true;
-            }
-        }
-        if (dest_bin && lto) {
-            WriteBitcodeToFile(*module, *dest_bin);
-        }
-
-        if (time_report) {
-            TimerGroup::printAll(errs());
-        }
-
-        // MPM goes out of scope and writes to the out streams
+    if (time_report) {
+        TimerGroup::printAll(errs());
     }
 
     delete dest_asm;
